@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "ai-creative-pipeline"
+version = "1.0.0"
+description = "AI Creative Pipeline - Transform text prompts into stunning images and 3D models"
+authors = ["AI Creative Team"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.8.1"
+openfabric-pysdk = "^0.3.0"
+requests = "^2.31.0"
+numpy = "^1.21.0"
+Pillow = "^9.0.0"
+fastapi = "^0.110.0"
+uvicorn = {extras = ["standard"], version = "^0.29.0"}
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.0.0"
+black = "^23.0.0"
+flake8 = "^6.0.0"
+
+[[tool.poetry.source]]
+name = "node2"
+url = "https://repo.node2.openfabric.network/index"
+priority = "supplemental"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+start = "python server.py"
