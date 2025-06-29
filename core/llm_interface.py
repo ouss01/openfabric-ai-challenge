@@ -10,19 +10,18 @@ import random
 import re
 from typing import Dict, List, Optional, Any
 import os
-
-# Try to import llama-cpp-python for local LLM support
-try:
-    from llama_cpp import Llama
-    LLAMA_AVAILABLE = True
-except ImportError:
-    LLAMA_AVAILABLE = False
-    logging.warning("llama-cpp-python not available. Using template-based processing only.")
+from pathlib import Path
+import requests
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+from dotenv import load_dotenv
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Load environment variables from config.env
+load_dotenv("config.env")
 
 class LLMInterface:
     """
@@ -30,52 +29,55 @@ class LLMInterface:
     Uses template-based expansion for consistent, high-quality results.
     """
 
-    def __init__(self, model_path: Optional[str] = None):
+    def __init__(self, model_path: Optional[str] = None, use_hf_api: bool = True):
         """
         Initialize the LLM interface.
         
         Args:
             model_path: Path to local LLM model (.gguf file)
+            use_hf_api: Whether to use Hugging Face API as fallback
         """
-        self.llm = None
-        self.model_path = model_path or self._find_model()
+        self.model_path = model_path
+        self.use_hf_api = use_hf_api
+        self.tokenizer = None
+        self.model = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
-        if self.model_path and LLAMA_AVAILABLE:
-            try:
-                self.llm = Llama(
-                    model_path=self.model_path,
-                    n_ctx=2048,
-                    n_threads=4,
-                    verbose=False
-                )
-                logger.info(f"✅ Local LLM loaded: {self.model_path}")
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to load local LLM: {e}")
-                self.llm = None
-        
-        if not self.llm:
-            logger.info("📝 Using template-based prompt processing")
+        # Try to load local model if path provided
+        if model_path and os.path.exists(model_path):
+            self._load_local_model()
+        elif use_hf_api:
+            logger.info("Using Hugging Face API for LLM processing")
+        else:
+            logger.warning("No local model or API available, using template expansion")
 
-    def _find_model(self) -> Optional[str]:
-        """Find a local LLM model file."""
-        possible_paths = [
-            "llama-2-7b-chat.gguf",
-            "../llama-2-7b-chat.gguf",
-            "models/llama-2-7b-chat.gguf",
-            "*.gguf"  # Any GGUF file
-        ]
-        
-        for path in possible_paths:
-            if os.path.exists(path):
-                return path
-        
-        # Search for any .gguf file
-        for root, dirs, files in os.walk("."):
-            for file in files:
-                if file.endswith(".gguf"):
-                    return os.path.join(root, file)
-        
-        return None
+    def _load_local_model(self):
+        """Load local model using transformers."""
+        try:
+            logger.info(f"Loading local model from {self.model_path}")
+            
+            # For GGUF files, we need to use a different approach
+            if self.model_path and self.model_path.endswith('.gguf'):
+                logger.warning("GGUF files require llama-cpp-python. Using template expansion instead.")
+                return
+            
+            # For regular Hugging Face models
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                device_map="auto" if self.device == "cuda" else None
+            )
+            
+            if self.device == "cpu":
+                self.model = self.model.to(self.device)
+            
+            logger.info(f"Model loaded successfully on {self.device}")
+            
+        except Exception as e:
+            logger.error(f"Failed to load local model: {e}")
+            self.tokenizer = None
+            self.model = None
 
     def analyze_prompt(self, prompt: str) -> Dict[str, Any]:
         """
@@ -87,87 +89,154 @@ class LLMInterface:
         Returns:
             Dictionary with analysis results
         """
-        if self.llm:
-            return self._analyze_with_llm(prompt)
+        if self.model and self.tokenizer:
+            return self._analyze_with_local_model(prompt)
+        elif self.use_hf_api:
+            return self._analyze_with_hf_api(prompt)
         else:
-            return self._analyze_with_templates(prompt)
+            return self._analyze_with_template(prompt)
 
-    def _analyze_with_llm(self, prompt: str) -> Dict[str, Any]:
-        """Analyze prompt using local LLM."""
+    def _analyze_with_local_model(self, prompt: str) -> Dict[str, Any]:
+        """Analyze prompt using local model."""
         try:
-            system_prompt = """Analyze the following creative prompt and provide:
-1. Word count
-2. Estimated quality (low/medium/high)
-3. Complexity level (low/medium/high)
-4. Suggestions for improvement
-5. Potential issues
+            if not self.model or not self.tokenizer:
+                return self._analyze_with_template(prompt)
+                
+            system_prompt = """Analyze this creative prompt and extract key information in JSON format:
+            - subject: main subject or focus
+            - style: artistic style mentioned
+            - mood: emotional tone
+            - colors: color scheme or palette
+            - lighting: lighting conditions
+            - composition: composition style
+            - details: specific details mentioned"""
+            
+            full_prompt = f"{system_prompt}\n\nPrompt: {prompt}\n\nAnalysis:"
+            
+            inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.device)
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=150,
+                    temperature=0.3,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Try to extract JSON from response
+            if "Analysis:" in response:
+                analysis_text = response.split("Analysis:")[-1].strip()
+                try:
+                    return json.loads(analysis_text)
+                except:
+                    pass
+            
+            return self._analyze_with_template(prompt)
+            
+        except Exception as e:
+            logger.error(f"Local model analysis failed: {e}")
+            return self._analyze_with_template(prompt)
 
-Format your response as JSON:
-{
-    "word_count": number,
-    "estimated_quality": "low|medium|high",
-    "complexity": "low|medium|high",
-    "suggestions": ["suggestion1", "suggestion2"],
-    "potential_issues": ["issue1", "issue2"]
-}"""
-
-            response = self.llm(
-                f"{system_prompt}\n\nPrompt: {prompt}\n\nAnalysis:",
-                max_tokens=500,
-                temperature=0.1,
-                stop=["\n\n"]
+    def _analyze_with_hf_api(self, prompt: str) -> Dict[str, Any]:
+        """Analyze prompt using Hugging Face API."""
+        try:
+            api_token = os.getenv("HUGGINGFACE_API_TOKEN")
+            if not api_token:
+                return self._analyze_with_template(prompt)
+            
+            model_id = "microsoft/DialoGPT-medium"
+            headers = {"Authorization": f"Bearer {api_token}"}
+            
+            system_prompt = "Analyze this creative prompt and extract key information:"
+            full_prompt = f"{system_prompt} {prompt}"
+            
+            payload = {
+                "inputs": full_prompt,
+                "parameters": {
+                    "max_new_tokens": 100,
+                    "temperature": 0.3,
+                    "do_sample": True
+                }
+            }
+            
+            response = requests.post(
+                f"https://api-inference.huggingface.co/models/{model_id}",
+                headers=headers,
+                json=payload,
+                timeout=30
             )
             
-            # Try to parse JSON from response
-            import json
-            try:
-                analysis = json.loads(response['choices'][0]['text'].strip())
-                return {
-                    "original_prompt": prompt,
-                    **analysis
-                }
-            except:
-                # Fallback to template analysis
-                return self._analyze_with_templates(prompt)
-                
+            if response.status_code == 200:
+                result = response.json()
+                if isinstance(result, list) and len(result) > 0:
+                    analysis = result[0].get("generated_text", "")
+                    # Try to parse as JSON or extract key info
+                    try:
+                        return json.loads(analysis)
+                    except:
+                        pass
+            
+            return self._analyze_with_template(prompt)
+            
         except Exception as e:
-            logger.error(f"LLM analysis failed: {e}")
-            return self._analyze_with_templates(prompt)
+            logger.error(f"Hugging Face API analysis failed: {e}")
+            return self._analyze_with_template(prompt)
 
-    def _analyze_with_templates(self, prompt: str) -> Dict[str, Any]:
-        """Analyze prompt using template-based rules."""
-        words = prompt.split()
-        word_count = len(words)
+    def _analyze_with_template(self, prompt: str) -> Dict[str, Any]:
+        """Analyze prompt using template-based approach."""
+        # Simple keyword-based analysis
+        prompt_lower = prompt.lower()
         
-        # Quality estimation based on word count and content
-        if word_count < 3:
-            quality = "low"
-        elif word_count < 8:
-            quality = "medium"
-        else:
-            quality = "high"
-        
-        # Complexity estimation
-        complex_words = ["detailed", "intricate", "complex", "sophisticated", "advanced"]
-        complexity = "high" if any(word in prompt.lower() for word in complex_words) else "medium"
-        
-        # Suggestions
-        suggestions = []
-        if word_count < 5:
-            suggestions.append("Consider adding more descriptive details")
-        if not any(adj in prompt.lower() for adj in ["beautiful", "stunning", "amazing", "detailed"]):
-            suggestions.append("Consider adding descriptive adjectives")
-        if word_count < 8:
-            suggestions.append("Use prompt enhancement for better results")
-        
-        return {
-            "original_prompt": prompt,
-            "word_count": word_count,
-            "estimated_quality": quality,
-            "complexity": complexity,
-            "suggestions": suggestions,
-            "potential_issues": []
+        analysis = {
+            "subject": prompt,
+            "style": "realistic",
+            "mood": "neutral",
+            "colors": "natural",
+            "lighting": "natural",
+            "composition": "balanced",
+            "details": "standard",
+            "word_count": len(prompt.split()),
+            "estimated_quality": "good",
+            "complexity": "medium",
+            "suggestions": []
         }
+        
+        # Detect style keywords
+        if any(word in prompt_lower for word in ["cartoon", "anime", "illustration"]):
+            analysis["style"] = "cartoon"
+        elif any(word in prompt_lower for word in ["abstract", "modern", "minimalist"]):
+            analysis["style"] = "abstract"
+        elif any(word in prompt_lower for word in ["vintage", "retro", "classic"]):
+            analysis["style"] = "vintage"
+        
+        # Detect mood keywords
+        if any(word in prompt_lower for word in ["dark", "mysterious", "gothic"]):
+            analysis["mood"] = "dark"
+        elif any(word in prompt_lower for word in ["bright", "cheerful", "happy"]):
+            analysis["mood"] = "bright"
+        elif any(word in prompt_lower for word in ["dramatic", "epic", "heroic"]):
+            analysis["mood"] = "dramatic"
+        
+        # Detect lighting keywords
+        if any(word in prompt_lower for word in ["sunset", "golden hour", "warm"]):
+            analysis["lighting"] = "warm"
+        elif any(word in prompt_lower for word in ["night", "moonlight", "blue"]):
+            analysis["lighting"] = "cool"
+        elif any(word in prompt_lower for word in ["dramatic", "contrast", "shadow"]):
+            analysis["lighting"] = "dramatic"
+        
+        # Add suggestions based on analysis
+        if analysis["word_count"] < 5:
+            analysis["suggestions"].append("Consider adding more descriptive details")
+        if analysis["style"] == "realistic":
+            analysis["suggestions"].append("Consider specifying an artistic style")
+        if "lighting" not in prompt_lower:
+            analysis["suggestions"].append("Consider adding lighting details")
+        
+        return analysis
 
     def enhance_prompt(self, prompt: str) -> str:
         """
@@ -179,14 +248,17 @@ Format your response as JSON:
         Returns:
             Enhanced prompt with additional details
         """
-        if self.llm:
-            return self._enhance_with_llm(prompt)
+        if self.model and self.tokenizer:
+            return self._enhance_with_local_model(prompt)
         else:
-            return self._enhance_with_templates(prompt)
+            return self._enhance_with_template(prompt)
 
-    def _enhance_with_llm(self, prompt: str) -> str:
-        """Enhance prompt using local LLM."""
+    def _enhance_with_local_model(self, prompt: str) -> str:
+        """Enhance prompt using local model."""
         try:
+            if not self.model or not self.tokenizer:
+                return self._enhance_with_template(prompt)
+                
             system_prompt = """Enhance the following creative prompt by adding:
 1. Descriptive adjectives
 2. Lighting and atmosphere details
@@ -196,21 +268,32 @@ Format your response as JSON:
 Make it more detailed and creative while keeping the original intent.
 Return only the enhanced prompt, no explanations."""
 
-            response = self.llm(
-                f"{system_prompt}\n\nOriginal: {prompt}\n\nEnhanced:",
-                max_tokens=200,
-                temperature=0.7,
-                stop=["\n\n"]
-            )
+            full_prompt = f"{system_prompt}\n\nOriginal: {prompt}\n\nEnhanced:"
             
-            enhanced = response['choices'][0]['text'].strip()
-            return enhanced if enhanced else self._enhance_with_templates(prompt)
+            inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.device)
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=200,
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            if full_prompt in response:
+                enhanced = response.split(full_prompt)[-1].strip()
+                return enhanced if enhanced else self._enhance_with_template(prompt)
+            else:
+                return self._enhance_with_template(prompt)
             
         except Exception as e:
-            logger.error(f"LLM enhancement failed: {e}")
-            return self._enhance_with_templates(prompt)
+            logger.error(f"Local model enhancement failed: {e}")
+            return self._enhance_with_template(prompt)
 
-    def _enhance_with_templates(self, prompt: str) -> str:
+    def _enhance_with_template(self, prompt: str) -> str:
         """Enhance prompt using template-based rules."""
         # Template-based enhancement
         styles = [
@@ -285,33 +368,48 @@ Return only the enhanced prompt, no explanations."""
         Returns:
             List of prompt variations
         """
-        if self.llm:
-            return self._generate_variations_with_llm(prompt, count)
+        if self.model and self.tokenizer:
+            return self._generate_variations_with_local_model(prompt, count)
         else:
-            return self._generate_variations_with_templates(prompt, count)
+            return self._generate_variations_with_template(prompt, count)
 
-    def _generate_variations_with_llm(self, prompt: str, count: int) -> List[str]:
-        """Generate variations using local LLM."""
+    def _generate_variations_with_local_model(self, prompt: str, count: int) -> List[str]:
+        """Generate variations using local model."""
         try:
+            if not self.model or not self.tokenizer:
+                return self._generate_variations_with_template(prompt, count)
+                
             system_prompt = f"""Generate {count} creative variations of the following prompt.
 Each variation should be different but maintain the same core concept.
 Return only the variations, one per line, no numbering."""
 
-            response = self.llm(
-                f"{system_prompt}\n\nOriginal: {prompt}\n\nVariations:",
-                max_tokens=300,
-                temperature=0.8,
-                stop=["\n\n"]
-            )
+            full_prompt = f"{system_prompt}\n\nOriginal: {prompt}\n\nVariations:"
             
-            variations = response['choices'][0]['text'].strip().split('\n')
-            return [v.strip() for v in variations if v.strip()][:count]
+            inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.device)
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=300,
+                    temperature=0.8,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            if full_prompt in response:
+                variations_text = response.split(full_prompt)[-1].strip()
+                variations = [v.strip() for v in variations_text.split('\n') if v.strip()]
+                return variations[:count]
+            else:
+                return self._generate_variations_with_template(prompt, count)
             
         except Exception as e:
-            logger.error(f"LLM variation generation failed: {e}")
-            return self._generate_variations_with_templates(prompt, count)
+            logger.error(f"Local model variation generation failed: {e}")
+            return self._generate_variations_with_template(prompt, count)
 
-    def _generate_variations_with_templates(self, prompt: str, count: int) -> List[str]:
+    def _generate_variations_with_template(self, prompt: str, count: int) -> List[str]:
         """Generate variations using template-based rules."""
         variations = []
         
@@ -340,4 +438,119 @@ Return only the variations, one per line, no numbering."""
             
             variations.append(variation)
         
-        return variations[:count] 
+        return variations[:count]
+
+    def chat(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+        """
+        Chat with the LLM.
+        
+        Args:
+            message: User message
+            history: Conversation history
+            
+        Returns:
+            LLM response
+        """
+        if self.model and self.tokenizer:
+            return self._chat_with_local_model(message, history)
+        elif self.use_hf_api:
+            return self._chat_with_hf_api(message, history)
+        else:
+            return self._chat_with_template(message, history)
+
+    def _chat_with_local_model(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+        """Chat using local model."""
+        try:
+            if not self.model or not self.tokenizer:
+                return self._chat_with_template(message, history)
+                
+            # Build conversation context
+            conversation = ""
+            if history:
+                for turn in history:
+                    conversation += f"User: {turn.get('user', '')}\nAssistant: {turn.get('assistant', '')}\n"
+            
+            full_prompt = f"{conversation}User: {message}\nAssistant:"
+            
+            inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.device)
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=150,
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            if full_prompt in response:
+                return response.split(full_prompt)[-1].strip()
+            else:
+                return response.strip()
+            
+        except Exception as e:
+            logger.error(f"Local model chat failed: {e}")
+            return self._chat_with_template(message, history)
+
+    def _chat_with_hf_api(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+        """Chat using Hugging Face API."""
+        try:
+            api_token = os.getenv("HUGGINGFACE_API_TOKEN")
+            if not api_token:
+                return self._chat_with_template(message, history)
+            
+            model_id = "microsoft/DialoGPT-medium"
+            headers = {"Authorization": f"Bearer {api_token}"}
+            
+            # Build conversation
+            conversation = ""
+            if history:
+                for turn in history:
+                    conversation += f"User: {turn.get('user', '')}\nAssistant: {turn.get('assistant', '')}\n"
+            
+            full_prompt = f"{conversation}User: {message}\nAssistant:"
+            
+            payload = {
+                "inputs": full_prompt,
+                "parameters": {
+                    "max_new_tokens": 150,
+                    "temperature": 0.7,
+                    "do_sample": True
+                }
+            }
+            
+            response = requests.post(
+                f"https://api-inference.huggingface.co/models/{model_id}",
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if isinstance(result, list) and len(result) > 0:
+                    response_text = result[0].get("generated_text", "")
+                    if full_prompt in response_text:
+                        return response_text.split(full_prompt)[-1].strip()
+                    return response_text.strip()
+            
+            return self._chat_with_template(message, history)
+            
+        except Exception as e:
+            logger.error(f"Hugging Face API chat failed: {e}")
+            return self._chat_with_template(message, history)
+
+    def _chat_with_template(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+        """Chat using template-based approach."""
+        responses = [
+            "I understand you're asking about creative content. Let me help you with that.",
+            "That's an interesting creative request. I can assist you with generating content based on your input.",
+            "I'm here to help with your creative projects. What specific details would you like me to focus on?",
+            "Great question! For creative content generation, I can help expand your ideas and provide detailed descriptions.",
+            "I'm ready to help with your creative needs. Let's work together to bring your vision to life."
+        ]
+        
+        import random
+        return random.choice(responses) 

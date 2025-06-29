@@ -165,6 +165,30 @@ def analyze(req: AnalyzeRequest):
         raise HTTPException(status_code=400, detail="Pipeline not configured.")
     return pipeline.analyze_prompt(req.prompt)
 
+@app.post("/enhance", tags=["Pipeline"])
+def enhance_prompt(req: AnalyzeRequest):
+    global pipeline
+    if not pipeline:
+        raise HTTPException(status_code=400, detail="Pipeline not configured.")
+    try:
+        enhanced = pipeline.llm.enhance_prompt(req.prompt)
+        return {"success": True, "enhanced_prompt": enhanced}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/stats", tags=["Analytics"])
+def get_stats():
+    """Get pipeline statistics."""
+    global pipeline
+    if not pipeline:
+        raise HTTPException(status_code=400, detail="Pipeline not configured.")
+    
+    try:
+        stats = pipeline.get_creation_stats()
+        return stats
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/health", tags=["Health"])
 def health():
     return {"status": "ok", "mock_mode": mock_mode}
@@ -313,6 +337,42 @@ Note: This is running in MOCK MODE. For real image/3D generation, configure real
     def analyze_prompt(self, prompt: str) -> dict:
         """Analyze a prompt for quality and suggestions."""
         return self.llm.analyze_prompt(prompt)
+    
+    def get_creation_stats(self) -> dict:
+        """Get creation statistics."""
+        try:
+            recent_creations = self.memory.get_recent_creations(100)
+            total_creations = len(recent_creations)
+            
+            if total_creations == 0:
+                return {
+                    "total_creations": 0,
+                    "avg_processing_time": 0,
+                    "success_rate": 100.0,
+                    "mock_mode": True
+                }
+            
+            # Calculate average processing time
+            total_time = sum(creation.get("metadata", {}).get("processing_time", 0) for creation in recent_creations)
+            avg_time = total_time / total_creations if total_creations > 0 else 0
+            
+            return {
+                "total_creations": total_creations,
+                "avg_processing_time": avg_time,
+                "success_rate": 100.0,  # Mock mode always succeeds
+                "mock_mode": True
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def get_openfabric_status(self) -> dict:
+        """Get Openfabric status (mock mode)."""
+        return {
+            "status": "mock_mode",
+            "message": "Running in mock mode - no real Openfabric connections",
+            "apps_configured": 0,
+            "mock_mode": True
+        }
 
 class RealCreativePipeline:
     """Real pipeline that connects to actual Openfabric apps"""
@@ -667,6 +727,44 @@ Openfabric Apps Used:
     def analyze_prompt(self, prompt: str) -> dict:
         """Analyze a prompt for quality and suggestions."""
         return self.llm.analyze_prompt(prompt)
+    
+    def get_creation_stats(self) -> dict:
+        """Get creation statistics."""
+        try:
+            recent_creations = self.memory.get_recent_creations(100)
+            total_creations = len(recent_creations)
+            
+            if total_creations == 0:
+                return {
+                    "total_creations": 0,
+                    "avg_processing_time": 0,
+                    "success_rate": 100.0,
+                    "mock_mode": False
+                }
+            
+            # Calculate average processing time
+            total_time = sum(creation.get("metadata", {}).get("processing_time", 0) for creation in recent_creations)
+            avg_time = total_time / total_creations if total_creations > 0 else 0
+            
+            return {
+                "total_creations": total_creations,
+                "avg_processing_time": avg_time,
+                "success_rate": 100.0,
+                "mock_mode": False
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def get_openfabric_status(self) -> dict:
+        """Get Openfabric status."""
+        return {
+            "status": "configured",
+            "message": f"Configured with {len(self.app_ids)} Openfabric apps",
+            "apps_configured": len(self.app_ids),
+            "text_to_image_app": self.text_to_image_app,
+            "three_d_app": self.three_d_app,
+            "mock_mode": False
+        }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8888))

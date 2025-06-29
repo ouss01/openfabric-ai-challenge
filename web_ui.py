@@ -50,6 +50,13 @@ st.markdown("""
 # API Configuration
 API_BASE_URL = "http://localhost:8888"
 
+# Add this after API_BASE_URL and before any function definitions
+DEFAULT_APP_IDS = [
+    "f0997a01-d6d3-a5fe-53d8-561300318557",
+    "69543f29-4d41-4afc-7f29-3d51591f11eb"
+]
+DEFAULT_MOCK_MODE = False
+
 def check_api_health():
     """Check if the API is running."""
     try:
@@ -121,6 +128,17 @@ def analyze_prompt(prompt):
 def main():
     # Header
     st.markdown('<h1 class="main-header">🎨 AI Creative Pipeline</h1>', unsafe_allow_html=True)
+    
+    # Auto-configure pipeline if not already configured
+    if 'pipeline_configured' not in st.session_state:
+        with st.spinner("Auto-configuring pipeline..."):
+            result = configure_pipeline(DEFAULT_APP_IDS, DEFAULT_MOCK_MODE)
+            if result.get("success"):
+                st.session_state.pipeline_configured = True
+                st.success("✅ Pipeline auto-configured!")
+            else:
+                st.session_state.pipeline_configured = False
+                st.error(f"❌ Auto-configuration failed: {result.get('error', 'Unknown error')}")
     
     # Check API health
     if not check_api_health():
@@ -198,30 +216,33 @@ def main():
                         if result.get("success"):
                             st.success("✅ Content generated successfully!")
                             
-                            # Display results
-                            col_a, col_b = st.columns(2)
+                            # Display enhanced prompt
+                            enhanced_prompt = result.get("enhanced_prompt", "")
+                            if enhanced_prompt:
+                                st.markdown(f"**Enhanced Prompt:** {enhanced_prompt}")
+                            else:
+                                st.info("No enhanced prompt returned.")
                             
-                            with col_a:
-                                st.subheader("📸 Generated Image")
-                                if os.path.exists(result.get("image_path", "")):
-                                    st.image(result["image_path"], caption="Generated Image")
-                                else:
-                                    st.warning("Image file not found")
+                            # Display generated image
+                            image_path = result.get("image_path", "")
+                            if image_path and os.path.exists(image_path):
+                                st.image(image_path, caption="Generated Image")
+                            elif image_path:
+                                st.warning(f"Image file not found: {image_path}")
+                            else:
+                                st.info("No image generated.")
                             
-                            with col_b:
-                                st.subheader("🎲 3D Model")
-                                st.info(f"3D Model: {result.get('model_3d_path', 'Not generated')}")
+                            # Display 3D model info
+                            model_3d_path = result.get("model_3d_path", "")
+                            if model_3d_path:
+                                st.info(f"3D Model: {model_3d_path}")
                             
                             # Display metadata
                             st.subheader("📋 Generation Details")
-                            
                             col_c, col_d = st.columns(2)
-                            
                             with col_c:
                                 st.write("**Original Prompt:**", result.get("original_prompt", ""))
-                                st.write("**Enhanced Prompt:**", result.get("enhanced_prompt", ""))
                                 st.write("**Memory ID:**", result.get("memory_id", ""))
-                            
                             with col_d:
                                 st.write("**Processing Time:**", f"{result.get('processing_time', 0):.2f}s")
                                 st.write("**Creation ID:**", result.get("creation_id", ""))
@@ -230,18 +251,13 @@ def main():
                             if "analysis" in result:
                                 st.subheader("🔍 Prompt Analysis")
                                 analysis = result["analysis"]
-                                
                                 col_e, col_f, col_g = st.columns(3)
-                                
                                 with col_e:
                                     st.metric("Word Count", analysis.get("word_count", 0))
-                                
                                 with col_f:
                                     st.metric("Quality", analysis.get("estimated_quality", "Unknown"))
-                                
                                 with col_g:
                                     st.metric("Complexity", analysis.get("complexity", "Unknown"))
-                                
                                 if analysis.get("suggestions"):
                                     st.info("💡 Suggestions: " + ", ".join(analysis["suggestions"]))
                         else:
@@ -260,6 +276,30 @@ def main():
                             st.json(result)
                         else:
                             st.error(f"❌ Analysis failed: {result.get('error', 'Unknown error')}")
+                else:
+                    st.warning("⚠️ Please enter a prompt")
+            
+            # New: Enhance Prompt button
+            if st.button("✨ Enhance Prompt"):
+                if prompt.strip():
+                    with st.spinner("Enhancing prompt..."):
+                        try:
+                            response = requests.post(
+                                f"{API_BASE_URL}/enhance",
+                                json={"prompt": prompt},
+                                timeout=10
+                            )
+                            if response.status_code == 200:
+                                data = response.json()
+                                if data.get("success"):
+                                    st.success("✨ Enhanced Prompt:")
+                                    st.info(data.get("enhanced_prompt", "No enhanced prompt returned."))
+                                else:
+                                    st.error(f"❌ Enhancement failed: {data.get('error', 'Unknown error')}")
+                            else:
+                                st.error(f"❌ Enhancement failed: {response.text}")
+                        except Exception as e:
+                            st.error(f"❌ Enhancement error: {e}")
                 else:
                     st.warning("⚠️ Please enter a prompt")
     
